@@ -125,6 +125,7 @@ class QueueItem:
         ADD = 1
         DELETE = 2
         QUIT = 3
+        SYNC = 4
 
     device: str
     interface: str
@@ -163,6 +164,9 @@ class PresenceDetector(Thread):
         self._online_clients: dict[str, set[str]] = {}
         self._registered_clients: set[str] = set()
         self._registered_signal_clients: set[str] = set()
+        # Keep track of devices already seen by this process so Home Assistant
+        # Discovery can be rebuilt after HA restarts even when a device is away.
+        self._known_clients: set[str] = set(self._settings.params.keys())
         self._last_published_signal_values: dict[tuple[str, str], int] = {}
         self._last_published_signal_availability: dict[tuple[str, str], bool] = {}
         self._signal_stop = Event()
@@ -233,9 +237,14 @@ class PresenceDetector(Thread):
             self._clear_signal_publish_cache()
         elif message.payload == b"online":
             self._logger.log("Home Assistant is back online")
+            # Discovery messages are not retained. They may have been published
+            # while HA was offline, so force both tracker and RSSI discovery to
+            # be registered again. Do the actual sync in the detector thread,
+            # not inside the Paho callback thread.
+            self._registered_clients.clear()
+            self._registered_signal_clients.clear()
             self._clear_signal_publish_cache()
-            self._do_full_sync()
-            self._signal_wakeup.set()
+            self._queue.put(QueueItem("sync", "", QueueItem.Action.SYNC))
 
     def _publish(self, topic: str, data: str, retain=False) -> bool:
         self._logger.log(f"Publishing to {topic}: {data}", True)
@@ -264,6 +273,8 @@ class PresenceDetector(Thread):
             device_info = Settings.deep_merge(device_info, params["device"])
         if "name" not in device_info and params.get("name"):
             device_info["name"] = params["name"]
+        device_info["manufacturer"] = "OpenWrt"
+        device_info["model"] = "Device tracker"
         return device_info
 
     def _ha_seen(self, device: str, seen: bool = True) -> bool:
@@ -283,11 +294,13 @@ class PresenceDetector(Thread):
                 "payload_home": self._settings.location,
                 "payload_not_home": self._settings.away,
                 "source_type": self._settings.source_type,
-                "device": {"connections": [["mac", device]]},
+                "device": self._device_info(device),
                 "unique_id": device_slug,
             }
             if device in self._settings.params:
                 body = Settings.deep_merge(body, self._settings.params[device])
+                body["device"]["manufacturer"] = "OpenWrt"
+                body["device"]["model"] = "Device tracker"
                 if "name" not in body["device"] and body.get("name"):
                     body["device"]["name"] = body["name"]
                 # When a configured name becomes the Home Assistant device name,
@@ -498,6 +511,7 @@ class PresenceDetector(Thread):
             if self._should_handle_device(client)
         }
         known_devices.update(self._settings.params.keys())
+        known_devices.update(self._known_clients)
         if complete:
             for device in known_devices - samples.keys():
                 self._set_signal_availability(device, False)
@@ -542,6 +556,7 @@ class PresenceDetector(Thread):
         """Mark a client as away in HA."""
         if not self._should_handle_device(device):
             return
+        self._known_clients.add(device)
         if device in self._online_clients[interface]:
             self._online_clients[interface].remove(device)
         for intf in set(self._settings.interfaces) - {interface}:
@@ -561,6 +576,7 @@ class PresenceDetector(Thread):
         """Add client to the 'add' queue."""
         if not self._should_handle_device(device):
             return
+        self._known_clients.add(device)
         self._queue.put(QueueItem(device, interface, QueueItem.Action.ADD))
         self._online_clients[interface].add(device)
         # Wake the poller so RSSI arrives immediately instead of waiting for the
@@ -630,32 +646,49 @@ class PresenceDetector(Thread):
         self._mqtt.disconnect()
         self._mqtt.loop_stop()
 
-    def _do_full_sync(self, away_only=False):
-        """Perform a full sync of all current online devices compared to last time."""
+    def _do_full_sync(self, away_only=False, republish_known=False):
+        """Perform a full sync of current devices and optionally rebuild HA state."""
         self._registered_clients = set()
         seen_now = set(self._get_all_online_devices())
         is_first_sync = self._last_seen_clients is None
         away = (self._last_seen_clients or set()) - seen_now
         self._last_seen_clients = seen_now
+
+        for _interface, client in seen_now:
+            if self._should_handle_device(client):
+                self._known_clients.add(client)
+
         for interface, client in seen_now:
             if not away_only:
                 self.set_device_home(interface, client)
+
+        away_macs: set[str] = set()
         for interface, client in away:
+            away_macs.add(client)
             self.set_device_away(interface, client)
 
-        if is_first_sync:
-            # Without this, a params-listed device that's currently offline but
-            # was previously marked home via a retained MQTT message can stay
-            # stuck home forever.
+        if is_first_sync or republish_known:
+            # Rebuild discovery/state for devices that are already away. This is
+            # required after an HA restart because MQTT Discovery config messages
+            # are not retained, and an already-away client generates no new
+            # disassoc event to recreate its entity/state.
             seen_macs = {client for _interface, client in seen_now}
-            for device in self._settings.params:
-                if device in seen_macs or not self._should_handle_device(device):
+            known_devices = set(self._known_clients) | set(self._settings.params.keys())
+            for device in known_devices:
+                if (
+                    device in seen_macs
+                    or device in away_macs
+                    or not self._should_handle_device(device)
+                ):
                     continue
                 self._logger.log(
-                    f"Device {device} is away (first sync, no prior state)", True
+                    f"Republishing away state for known device {device}", True
                 )
-                self._ha_seen(device, seen=False)
-                self._set_signal_availability(device, False)
+                self._queue.put(QueueItem(device, "", QueueItem.Action.DELETE))
+
+            # RSSI discovery/state is rebuilt by the signal poller, outside the
+            # MQTT callback thread.
+            self._signal_wakeup.set()
 
     def run(self) -> None:
         """Main loop for the presence detector."""
@@ -680,6 +713,12 @@ class PresenceDetector(Thread):
             if item.action == QueueItem.Action.QUIT:
                 self._queue.task_done()
                 break
+
+            if item.action == QueueItem.Action.SYNC:
+                self._do_full_sync(republish_known=True)
+                self._signal_wakeup.set()
+                self._queue.task_done()
+                continue
 
             if self._ha_seen(item.device, item.action == QueueItem.Action.ADD):
                 if mq_is_offline:
