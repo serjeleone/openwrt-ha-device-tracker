@@ -283,8 +283,13 @@ class PresenceDetector(Thread):
             }
             if device in self._settings.params:
                 body = Settings.deep_merge(body, self._settings.params[device])
-                if "name" not in body["device"]:
+                if "name" not in body["device"] and body.get("name"):
                     body["device"]["name"] = body["name"]
+                # When a configured name becomes the Home Assistant device name,
+                # make the tracker the device's primary entity instead of
+                # repeating the same name as both device and entity name.
+                if body["device"].get("name") == body.get("name"):
+                    body["name"] = None
             ok &= self._publish(
                 f"homeassistant/device_tracker/{device_slug}/config", json.dumps(body)
             )
