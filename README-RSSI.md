@@ -17,7 +17,18 @@ apk add rpcd-mod-iwinfo
 
 ## Configuration
 
-Add the optional setting:
+Use `allow_list` to limit tracking to specific Wi-Fi clients:
+
+```json
+"allow_list": [
+  "aa:bb:cc:dd:ee:ff",
+  "11:22:33:44:55:66"
+]
+```
+
+An empty list (`"allow_list": []`) tracks all Wi-Fi clients. When the list is not empty, only the listed MAC addresses get a `device_tracker` and RSSI sensors. MAC matching is case-insensitive.
+
+Add the optional signal polling setting:
 
 ```json
 "signal_poll_interval": 5
