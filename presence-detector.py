@@ -163,6 +163,8 @@ class PresenceDetector(Thread):
         self._online_clients: dict[str, set[str]] = {}
         self._registered_clients: set[str] = set()
         self._registered_signal_clients: set[str] = set()
+        self._last_published_signal_values: dict[tuple[str, str], int] = {}
+        self._last_published_signal_availability: dict[tuple[str, str], bool] = {}
         self._signal_stop = Event()
         self._signal_wakeup = Event()
         self._signal_thread: Thread | None = None
@@ -220,6 +222,7 @@ class PresenceDetector(Thread):
         self._logger.log(f"MQTT broker disconnected (rc: {reason_code})")
         self._registered_clients.clear()
         self._registered_signal_clients.clear()
+        self._clear_signal_publish_cache()
 
     def _on_ha_status_message(self, _client, _userdata, message):
         """Callback for HA status messages."""
@@ -227,8 +230,10 @@ class PresenceDetector(Thread):
             self._logger.log("Home Assistant is offline!")
             self._registered_clients.clear()
             self._registered_signal_clients.clear()
+            self._clear_signal_publish_cache()
         elif message.payload == b"online":
             self._logger.log("Home Assistant is back online")
+            self._clear_signal_publish_cache()
             self._do_full_sync()
             self._signal_wakeup.set()
 
@@ -340,13 +345,18 @@ class PresenceDetector(Thread):
             self._registered_signal_clients.add(device_slug)
         return ok
 
+    def _clear_signal_publish_cache(self) -> None:
+        """Forget published RSSI values so the next poll republishes current state."""
+        self._last_published_signal_values.clear()
+        self._last_published_signal_availability.clear()
+
     def _set_signal_availability(
         self,
         device: str,
         available: bool,
         sensor_suffix: str | None = None,
     ) -> bool:
-        """Set one or both RSSI sensors available/unavailable."""
+        """Publish RSSI availability only when it actually changes."""
         if self._settings.signal_poll_interval <= 0:
             return True
         if not self._should_handle_device(device):
@@ -361,15 +371,21 @@ class PresenceDetector(Thread):
         )
         payload = "online" if available else "offline"
         for suffix in suffixes:
-            ok &= self._publish(
+            cache_key = (device_slug, suffix)
+            if self._last_published_signal_availability.get(cache_key) == available:
+                continue
+            published = self._publish(
                 f"homeassistant/sensor/{device_slug}_{suffix}/availability",
                 payload,
                 retain=self._settings.mqtt_retain_state,
             )
+            ok &= published
+            if published:
+                self._last_published_signal_availability[cache_key] = available
         return ok
 
     def _publish_signal_sample(self, device: str, sample: SignalSample) -> bool:
-        """Publish current and average signal strength for a Wi-Fi client."""
+        """Publish RSSI only when values or availability change."""
         if not self._should_handle_device(device):
             return True
         if not self._register_signal_sensors(device):
@@ -382,24 +398,25 @@ class PresenceDetector(Thread):
             "average_signal_strength": sample.signal_avg,
         }
         for suffix, value in values.items():
-            topic_base = f"homeassistant/sensor/{device_slug}_{suffix}"
             if value is None:
-                ok &= self._publish(
-                    f"{topic_base}/availability",
-                    "offline",
+                ok &= self._set_signal_availability(device, False, suffix)
+                continue
+
+            cache_key = (device_slug, suffix)
+            state_ok = True
+            if self._last_published_signal_values.get(cache_key) != value:
+                topic_base = f"homeassistant/sensor/{device_slug}_{suffix}"
+                state_ok = self._publish(
+                    f"{topic_base}/state",
+                    str(value),
                     retain=self._settings.mqtt_retain_state,
                 )
-                continue
-            ok &= self._publish(
-                f"{topic_base}/state",
-                str(value),
-                retain=self._settings.mqtt_retain_state,
-            )
-            ok &= self._publish(
-                f"{topic_base}/availability",
-                "online",
-                retain=self._settings.mqtt_retain_state,
-            )
+                ok &= state_ok
+                if state_ok:
+                    self._last_published_signal_values[cache_key] = value
+
+            if state_ok:
+                ok &= self._set_signal_availability(device, True, suffix)
         return ok
 
     @staticmethod
