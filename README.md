@@ -21,6 +21,8 @@ making your home automation a lot more responsive.
 It can handle network failures or Home Assistant being offline, and will recover once Home Assistant is back online.
 It does this by adding all events to a queue and making sure every event is accepted by Home Assistant before removing it from the queue.
 
+This fork also publishes current and average Wi-Fi signal strength through MQTT Discovery. Signal values are read locally from OpenWrt `iwinfo`, so Home Assistant does not poll the router.
+
 ## Installation
 
 ### Steps to perform on your OpenWRT device
@@ -29,7 +31,7 @@ It does this by adding all events to a queue and making sure every event is acce
 * Make presence-detector.py executable: chmod +x presence-detector.py
 * Place the init-script from this repo's init.d directory into /etc/init.d on your device
 * Make the init-script executable: chmod +x /etc/init.d/presence-detector
-* Install python + deps: apk update && apk add python3-light python3-paho-mqtt python3-codecs python3-urllib python3-logging.
+* Install python + deps: `apk update && apk add python3-light python3-paho-mqtt python3-codecs python3-urllib python3-logging rpcd-mod-iwinfo`.
 * Adjust /etc/config/presence-detector.settings.json to your needs (see below)
 * run 'service presence-detector enable' to enable the service at startup
 * run 'service presence-detector start', or simply reboot
@@ -50,8 +52,7 @@ The settings file on your OpenWRT device looks like this:
   "mqtt_password": "<PASSWORD>",
   "mqtt_retain_state": true,
   "interfaces": ["hostapd.wlan0", "hostapd.wlan1"],
-  "filter_is_denylist": true,
-  "filter": ["01:23:45:67:89:ab"],
+  "allow_list": ["01:23:45:67:89:ab"],
   "params": {
     "XX:YY:DD:AA:TT:QQ": {
       "name": "Dave",
@@ -62,6 +63,8 @@ The settings file on your OpenWRT device looks like this:
   "location": "home",
   "away": "not_home",
   "fallback_sync_interval": 0,
+  "signal_poll_interval": 5,
+  "source_type": "router",
   "debug": false
 }
 ```
@@ -72,9 +75,8 @@ These settings will need a bit of explaining:
 * mqtt_username: The username to use for authentication to the MQTT broker.
 * mqtt_password: The password to use for authentication to the MQTT broker.
 * mqtt_retain_state: Whether to set the 'retain' flag on MQTT state messages. This ensures that the device state is remembered by the MQTT broker and immediately available to Home Assistant when it connects. Default: true
-* interfaces: A list of Wi-Fi interfaces to monitor. Leave this unset (or an empty list) to auto-detect and monitor all WiFi interfaces. 
-* filter_is_denylist: Defines how the `filter` list is used. If `true`, the listed devices are ignored (denylist). If `false`, only the listed devices are monitored (allowlist).
-* filter: A list of MAC addresses to either ignore or monitor, depending on the `filter_is_denylist` setting.
+* interfaces: A list of Wi-Fi interfaces to monitor. Leave this unset (or an empty list) to auto-detect and monitor all WiFi interfaces.
+* allow_list: A list of MAC addresses to track. When the list is non-empty, only these clients get a `device_tracker` and RSSI sensors. An empty list (`[]`) tracks all Wi-Fi clients. MAC matching is case-insensitive.
 * params: An optional dictionary containing additional parameters for specific devices (see the example above).
 If specified, these are sent to HA together with the MAC address and location name. For information on which keys you can add, see [here](https://www.home-assistant.io/integrations/device_tracker.mqtt/#device_tracker-mqtt-configuration-variables).
 For info on how these params appear in HA see [below](#optional-home-assistant-configuration)
@@ -83,8 +85,11 @@ For info on how these params appear in HA see [below](#optional-home-assistant-c
 * away: Custom location name to be sent when a device is no longer connected. Default: "not_home"
 * fallback_sync_interval: Interval in seconds to perform a full sync of online/offline devices to HA. Enable this as a fallback option if you have issues with devices not being detected as 'offline' when they go out of WiFi range.
 **NOTE**: this will perform a 'ubus get clients' call every X seconds, which could increase load on the router. Default 0 (disabled)
+* signal_poll_interval: Interval in seconds for local `iwinfo assoclist` polling used to publish current (`signal`) and average (`signal_avg`) RSSI through MQTT. Default: 5. Set to 0 to disable the RSSI sensors.
 * source_type: This is the type of device that gets sent to HA to represent the tracking device. It defaults to 'router', but can also be set to 'gps' to allow for different zones/locations to work.
 * debug: Enable or disable debugging (prints state information on stdout when enabled). Default: false
+
+For more details about the RSSI sensors, availability handling and roaming behavior, see [README-RSSI.md](README-RSSI.md).
 
 ## (Optional) Home Assistant Configuration
 This section goes into a bit more detail about where the entity information discovered by OpenWRT is stored in HA, and how you can tune
@@ -151,13 +156,14 @@ Version 2 used the 'see' service API to update device state, which is not deprec
 ### Migration Steps
 1. **Install new dependencies** on your OpenWRT device:
    ```bash
-   apk update && apk add python3-paho-mqtt
+   apk update && apk add python3-paho-mqtt rpcd-mod-iwinfo
    ```
    (You can optionally remove the old dependency: `apk del python3-requests`)
 
 2. **Update your configuration**: Edit `presence-detector.settings.json`.
    * Remove `hass_url` and `hass_token`.
    * Add `mqtt_host`, `mqtt_port` (usually 1883), `mqtt_username`, and `mqtt_password`.
+   * Use `allow_list` if you only want to track selected Wi-Fi clients.
    * Check the [OpenWRT device configuration](#openwrt-device-configuration) section for the new format.
 
 3. **Enable MQTT in Home Assistant**: Make sure the MQTT integration is installed and configured in Home Assistant.
@@ -182,7 +188,7 @@ In case something doesn't work, here are a some things you can do to check your 
 ```
 nc <MQTT_HOST> <MQTT_PORT>
 ```
-This should not return an error and open a connection. If you type some text it should disconnect. 
+This should not return an error and open a connection. If you type some text it should disconnect.
 If the connection not OK, check your firewall settings, if the broker is running, etc.
 * Disconnect and then re-connect a Wi-Fi device and check if you see logging that resembles this:
 ```text

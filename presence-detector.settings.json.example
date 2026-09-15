@@ -5,8 +5,7 @@
   "mqtt_password": "<PASSWORD>",
   "mqtt_retain_state": true,
   "interfaces": ["hostapd.wlan0", "hostapd.wlan1"],
-  "filter_is_denylist": true,
-  "filter": ["01:23:45:67:89:ab"],
+  "allow_list": ["01:23:45:67:89:ab"],
   "params": {
     "XX:YY:DD:AA:TT:QQ": {
       "name": "Dave",
@@ -17,6 +16,7 @@
   "location": "home",
   "away": "not_home",
   "fallback_sync_interval": 0,
+  "signal_poll_interval": 5,
   "source_type": "router",
   "debug": false
 }
