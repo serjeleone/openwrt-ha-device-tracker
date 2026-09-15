@@ -56,8 +56,7 @@ class Settings:
             "mqtt_password": "",
             "mqtt_retain_state": True,
             "interfaces": [],
-            "filter_is_denylist": True,
-            "filter": [],
+            "allow_list": [],
             "params": {},
             "location": "home",
             "away": "not_home",
@@ -69,8 +68,10 @@ class Settings:
         with open(config_file, "r", encoding="utf-8") as settings:
             self._settings.update(json.load(settings))
 
-        # Lowercase all MAC addresses in the filter and params settings.
-        self._settings["filter"] = [device.lower() for device in self.filter]
+        # Lowercase all MAC addresses in the allow list and params settings.
+        self._settings["allow_list"] = [
+            device.lower() for device in self.allow_list
+        ]
         self._settings["params"] = {
             device.lower(): params for device, params in self.params.items()
         }
@@ -571,11 +572,11 @@ class PresenceDetector(Thread):
         return devices
 
     def _should_handle_device(self, device: str) -> bool:
-        """Check if a device should be handled by checking the allow/deny list."""
+        """Return whether a device is allowed to be tracked."""
         device = device.lower()
-        if device in self._settings.filter:
-            return not self._settings.filter_is_denylist
-        return self._settings.filter_is_denylist
+        if not self._settings.allow_list:
+            return True
+        return device in self._settings.allow_list
 
     def start_watchers(self) -> None:
         """Start ubus watcher threads for every interface."""
