@@ -5,7 +5,7 @@
 A Wi-Fi device presence detector for Home Assistant that runs on OpenWRT.
 
 Presence is event-driven through hostapd ubus assoc/disassoc events. Wi-Fi signal
-telemetry is read locally from ubus iwinfo and pushed to Home Assistant through
+telemetry is read locally from iw station dumps and pushed to Home Assistant through
 MQTT Discovery.
 """
 
@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from queue import Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable
 
 from paho.mqtt import client as mqtt
@@ -60,8 +60,8 @@ class Settings:
             "params": {},
             "location": "home",
             "away": "not_home",
-            "fallback_sync_interval": 0,
-            "signal_poll_interval": 5,
+            "fallback_sync_interval": 60,
+            "signal_poll_interval": 2,
             "source_type": "router",
             "debug": False,
         }
@@ -82,7 +82,7 @@ class Settings:
                 self._settings["signal_poll_interval"]
             )
         except (TypeError, ValueError):
-            self._settings["signal_poll_interval"] = 5.0
+            self._settings["signal_poll_interval"] = 2.0
         if self._settings["signal_poll_interval"] < 0:
             self._settings["signal_poll_interval"] = 0.0
 
@@ -151,7 +151,7 @@ class SignalSample:
 
 
 class PresenceDetector(Thread):
-    """Presence detector using ubus events plus local iwinfo signal polling."""
+    """Presence detector using ubus events plus local iw signal polling."""
 
     def __init__(self, config_file: str) -> None:
         super().__init__()
@@ -169,6 +169,7 @@ class PresenceDetector(Thread):
         self._known_clients: set[str] = set(self._settings.params.keys())
         self._last_published_signal_values: dict[tuple[str, str], int] = {}
         self._last_published_signal_availability: dict[tuple[str, str], bool] = {}
+        self._clients_lock = Lock()
         self._signal_stop = Event()
         self._signal_wakeup = Event()
         self._signal_thread: Thread | None = None
@@ -294,7 +295,7 @@ class PresenceDetector(Thread):
                 "payload_home": self._settings.location,
                 "payload_not_home": self._settings.away,
                 "source_type": self._settings.source_type,
-                "device": self._device_info(device),
+                "device": {"connections": [["mac", device]]},
                 "unique_id": device_slug,
             }
             if device in self._settings.params:
@@ -433,89 +434,143 @@ class PresenceDetector(Thread):
         return ok
 
     @staticmethod
-    def _iwinfo_device(interface: str) -> str:
-        """Convert hostapd.foo ubus object name to iwinfo interface name foo."""
+    def _wireless_interface(interface: str) -> str:
+        """Convert hostapd.foo ubus object name to wireless interface name foo."""
         prefix = "hostapd."
         return interface[len(prefix) :] if interface.startswith(prefix) else interface
 
-    def _get_signal_samples(self) -> tuple[dict[str, SignalSample], bool]:
-        """Read iwinfo assoclist and return samples plus full-poll success."""
+    def _active_signal_interfaces(self) -> list[str]:
+        """Return interfaces that currently contain at least one tracked client."""
+        with self._clients_lock:
+            return [
+                interface
+                for interface, clients in self._online_clients.items()
+                if any(self._should_handle_device(client) for client in clients)
+            ]
+
+    @staticmethod
+    def _parse_signal_value(text: str) -> int | None:
+        """Parse the first numeric dBm value from an iw signal field."""
+        try:
+            return int(float(text.strip().split()[0]))
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def _parse_iw_station_dump(
+        self, interface: str, output: str
+    ) -> dict[str, SignalSample]:
+        """Parse all tracked stations from one iw station dump in a single pass."""
+        samples: dict[str, SignalSample] = {}
+        current_device: str | None = None
+        current_signal: int | None = None
+        current_signal_avg: int | None = None
+
+        def save_current() -> None:
+            if current_device is None or not self._should_handle_device(current_device):
+                return
+            samples[current_device] = SignalSample(
+                interface, current_signal, current_signal_avg
+            )
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Station "):
+                save_current()
+                parts = line.split()
+                current_device = parts[1].lower() if len(parts) > 1 else None
+                current_signal = None
+                current_signal_avg = None
+                continue
+
+            if current_device is None:
+                continue
+            if line.startswith("signal avg:"):
+                current_signal_avg = self._parse_signal_value(
+                    line[len("signal avg:") :]
+                )
+            elif line.startswith("signal:"):
+                current_signal = self._parse_signal_value(line[len("signal:") :])
+
+        save_current()
+        return samples
+
+    def _get_signal_samples(
+        self, interfaces: list[str]
+    ) -> tuple[dict[str, SignalSample], bool]:
+        """Read RSSI only from interfaces that currently contain tracked clients."""
         samples: dict[str, SignalSample] = {}
         complete = True
-        for interface in self._settings.interfaces:
-            iwinfo_device = self._iwinfo_device(interface)
-            request = json.dumps({"device": iwinfo_device}, separators=(",", ":"))
-            process = subprocess.run(
-                ["ubus", "call", "iwinfo", "assoclist", request],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+
+        for interface in interfaces:
+            wireless_interface = self._wireless_interface(interface)
+            try:
+                process = subprocess.run(
+                    ["iw", "dev", wireless_interface, "station", "dump"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError as ex:
+                self._logger.log(
+                    f"Error running iw for {wireless_interface}: {ex}"
+                )
+                complete = False
+                continue
+
             if process.returncode != 0:
                 self._logger.log(
-                    f"Error reading iwinfo for {iwinfo_device}: {process.stderr.strip()}"
-                )
-                complete = False
-                continue
-            try:
-                response = json.loads(process.stdout)
-            except json.JSONDecodeError as ex:
-                self._logger.log(
-                    f"Invalid iwinfo response for {iwinfo_device}: {ex}"
+                    f"Error reading iw station dump for {wireless_interface}: "
+                    f"{process.stderr.strip()}"
                 )
                 complete = False
                 continue
 
-            for station in response.get("results", []):
-                device = str(station.get("mac", "")).lower()
-                if not device or not self._should_handle_device(device):
-                    continue
-
-                signal_value = station.get("signal")
-                signal_avg_value = station.get("signal_avg")
-                try:
-                    current_signal = (
-                        int(signal_value) if signal_value is not None else None
-                    )
-                except (TypeError, ValueError):
-                    current_signal = None
-                try:
-                    average_signal = (
-                        int(signal_avg_value) if signal_avg_value is not None else None
-                    )
-                except (TypeError, ValueError):
-                    average_signal = None
-
-                sample = SignalSample(interface, current_signal, average_signal)
+            interface_samples = self._parse_iw_station_dump(
+                interface, process.stdout
+            )
+            for device, sample in interface_samples.items():
                 previous = samples.get(device)
                 if previous is None or sample.strength > previous.strength:
                     samples[device] = sample
 
         return samples, complete
 
+    def _known_tracked_devices(self) -> set[str]:
+        """Return all tracked devices known from config, events, or current state."""
+        with self._clients_lock:
+            online_devices = {
+                client
+                for clients in self._online_clients.values()
+                for client in clients
+                if self._should_handle_device(client)
+            }
+        devices = online_devices | set(self._settings.params.keys()) | self._known_clients
+        return {device for device in devices if self._should_handle_device(device)}
+
     def _update_signal_sensors(self) -> None:
-        """Poll local iwinfo and push RSSI telemetry to MQTT."""
+        """Poll active Wi-Fi interfaces with iw and push RSSI telemetry to MQTT."""
         if self._settings.signal_poll_interval <= 0:
             return
 
-        samples, complete = self._get_signal_samples()
+        active_interfaces = self._active_signal_interfaces()
+        known_devices = self._known_tracked_devices()
+
+        # No tracked clients are currently associated, so avoid all fast RSSI
+        # polling. Assoc events wake the poller immediately when one comes back.
+        if not active_interfaces:
+            for device in known_devices:
+                self._set_signal_availability(device, False)
+            return
+
+        samples, complete = self._get_signal_samples(active_interfaces)
         for device, sample in samples.items():
             self._publish_signal_sample(device, sample)
 
-        # Mark already-known tracked devices unavailable only when they are no
-        # longer reported by iwinfo on any monitored radio.
-        known_devices = {
-            client
-            for clients in self._online_clients.values()
-            for client in clients
-            if self._should_handle_device(client)
-        }
-        known_devices.update(self._settings.params.keys())
-        known_devices.update(self._known_clients)
+        missing_devices = known_devices - samples.keys()
         if complete:
-            for device in known_devices - samples.keys():
+            for device in missing_devices:
                 self._set_signal_availability(device, False)
-        elif known_devices - samples.keys():
+        elif missing_devices:
             self._logger.log(
                 "Signal poll incomplete; keeping previous availability for missing devices",
                 True,
@@ -557,17 +612,24 @@ class PresenceDetector(Thread):
         if not self._should_handle_device(device):
             return
         self._known_clients.add(device)
-        if device in self._online_clients[interface]:
-            self._online_clients[interface].remove(device)
-        for intf in set(self._settings.interfaces) - {interface}:
-            if device in self._online_clients[intf]:
-                # Device is still connected to another interface -> ignore.
-                self._logger.log(
-                    f"Device {device} still connected to {intf}, ignoring away event.",
-                    True,
-                )
-                self._signal_wakeup.set()
-                return
+        with self._clients_lock:
+            self._online_clients[interface].discard(device)
+            other_interface = next(
+                (
+                    intf
+                    for intf in set(self._settings.interfaces) - {interface}
+                    if device in self._online_clients[intf]
+                ),
+                None,
+            )
+        if other_interface is not None:
+            # Device is still connected to another interface -> ignore.
+            self._logger.log(
+                f"Device {device} still connected to {other_interface}, ignoring away event.",
+                True,
+            )
+            self._signal_wakeup.set()
+            return
         self._queue.put(QueueItem(device, interface, QueueItem.Action.DELETE))
         self._set_signal_availability(device, False)
         self._logger.log(f"Device {device} on {interface} is now away")
@@ -578,7 +640,8 @@ class PresenceDetector(Thread):
             return
         self._known_clients.add(device)
         self._queue.put(QueueItem(device, interface, QueueItem.Action.ADD))
-        self._online_clients[interface].add(device)
+        with self._clients_lock:
+            self._online_clients[interface].add(device)
         # Wake the poller so RSSI arrives immediately instead of waiting for the
         # next regular signal_poll_interval tick.
         self._signal_wakeup.set()
