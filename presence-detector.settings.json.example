@@ -15,8 +15,10 @@
   "ap_name": "",
   "location": "home",
   "away": "not_home",
-  "fallback_sync_interval": 0,
-  "signal_poll_interval": 5,
+  "fallback_sync_interval": 60,
+  "signal_poll_interval": 2,
+  "health_heartbeat_interval": 10,
+  "health_expire_after": 30,
   "source_type": "router",
   "debug": false
 }

@@ -62,6 +62,8 @@ class Settings:
             "away": "not_home",
             "fallback_sync_interval": 60,
             "signal_poll_interval": 2,
+            "health_heartbeat_interval": 10,
+            "health_expire_after": 30,
             "source_type": "router",
             "debug": False,
         }
@@ -85,6 +87,24 @@ class Settings:
             self._settings["signal_poll_interval"] = 2.0
         if self._settings["signal_poll_interval"] < 0:
             self._settings["signal_poll_interval"] = 0.0
+
+        try:
+            self._settings["health_heartbeat_interval"] = float(
+                self._settings["health_heartbeat_interval"]
+            )
+        except (TypeError, ValueError):
+            self._settings["health_heartbeat_interval"] = 10.0
+        if self._settings["health_heartbeat_interval"] < 0:
+            self._settings["health_heartbeat_interval"] = 0.0
+
+        try:
+            self._settings["health_expire_after"] = int(
+                self._settings["health_expire_after"]
+            )
+        except (TypeError, ValueError):
+            self._settings["health_expire_after"] = 30
+        if self._settings["health_expire_after"] < 1:
+            self._settings["health_expire_after"] = 30
 
         if not self._settings["interfaces"]:
             self._settings["interfaces"] = self.list_wifi_interfaces()
@@ -126,6 +146,7 @@ class QueueItem:
         DELETE = 2
         QUIT = 3
         SYNC = 4
+        HEALTH = 5
 
     device: str
     interface: str
@@ -173,6 +194,10 @@ class PresenceDetector(Thread):
         self._signal_stop = Event()
         self._signal_wakeup = Event()
         self._signal_thread: Thread | None = None
+        self._health_registered = False
+        self._health_stop = Event()
+        self._health_pending = Event()
+        self._health_thread: Thread | None = None
         for interface in self._settings.interfaces:
             self._online_clients[interface] = set()
         self._connect_to_mqtt()
@@ -192,6 +217,13 @@ class PresenceDetector(Thread):
         self._mqtt.username_pw_set(
             self._settings.mqtt_username, self._settings.mqtt_password
         )
+        if self._settings.health_heartbeat_interval > 0:
+            self._mqtt.will_set(
+                self._health_state_topic(),
+                payload="offline",
+                qos=1,
+                retain=False,
+            )
         self._mqtt.reconnect_delay_set(min_delay=1, max_delay=60)
         self._mqtt.message_callback_add(
             "homeassistant/status", self._on_ha_status_message
@@ -216,6 +248,7 @@ class PresenceDetector(Thread):
         self._logger.log("MQTT broker connected")
         self._mqtt.subscribe("homeassistant/status")
         self._signal_wakeup.set()
+        self._queue_health_check()
 
     def _on_mqtt_connect_fail(self, _client, _userdata):
         """Callback for MQTT connection failures."""
@@ -227,6 +260,7 @@ class PresenceDetector(Thread):
         self._logger.log(f"MQTT broker disconnected (rc: {reason_code})")
         self._registered_clients.clear()
         self._registered_signal_clients.clear()
+        self._health_registered = False
         self._clear_signal_publish_cache()
 
     def _on_ha_status_message(self, _client, _userdata, message):
@@ -235,6 +269,7 @@ class PresenceDetector(Thread):
             self._logger.log("Home Assistant is offline!")
             self._registered_clients.clear()
             self._registered_signal_clients.clear()
+            self._health_registered = False
             self._clear_signal_publish_cache()
         elif message.payload == b"online":
             self._logger.log("Home Assistant is back online")
@@ -244,8 +279,10 @@ class PresenceDetector(Thread):
             # not inside the Paho callback thread.
             self._registered_clients.clear()
             self._registered_signal_clients.clear()
+            self._health_registered = False
             self._clear_signal_publish_cache()
             self._queue.put(QueueItem("sync", "", QueueItem.Action.SYNC))
+            self._queue_health_check()
 
     def _publish(self, topic: str, data: str, retain=False) -> bool:
         self._logger.log(f"Publishing to {topic}: {data}", True)
@@ -258,6 +295,96 @@ class PresenceDetector(Thread):
             self._logger.log(f"Error publishing to {topic}: {ex}", False)
             return False
         return result.is_published()
+
+    def _health_slug(self) -> str:
+        """Return the stable MQTT/HA slug used for the service health entity."""
+        prefix = f"{self._settings.ap_name}_" if self._settings.ap_name else "openwrt_"
+        return f"{prefix}presence_detector"
+
+    def _health_state_topic(self) -> str:
+        """Return the MQTT state topic used by the service health entity."""
+        return f"homeassistant/binary_sensor/{self._health_slug()}/state"
+
+    def _register_health_sensor(self) -> bool:
+        """Register the service health binary sensor through MQTT Discovery."""
+        if self._settings.health_heartbeat_interval <= 0:
+            return True
+        if self._health_registered:
+            return True
+
+        health_slug = self._health_slug()
+        body = {
+            "state_topic": self._health_state_topic(),
+            "payload_on": "online",
+            "payload_off": "offline",
+            "device_class": "connectivity",
+            "entity_category": "diagnostic",
+            "expire_after": self._settings.health_expire_after,
+            "name": "Presence Detector",
+            "unique_id": health_slug,
+            "device": {
+                "identifiers": [health_slug],
+                "name": "OpenWrt Presence Detector",
+                "manufacturer": "OpenWrt",
+                "model": "Presence Detector",
+            },
+        }
+        published = self._publish(
+            f"homeassistant/binary_sensor/{health_slug}/config",
+            json.dumps(body),
+        )
+        if published:
+            self._health_registered = True
+        return published
+
+    def _publish_health(self, online: bool = True) -> bool:
+        """Publish service health from the detector's main working thread."""
+        if self._settings.health_heartbeat_interval <= 0:
+            return True
+        if online and not self._register_health_sensor():
+            return False
+        return self._publish(
+            self._health_state_topic(),
+            "online" if online else "offline",
+            retain=False,
+        )
+
+    def _queue_health_check(self) -> None:
+        """Queue one health heartbeat without allowing duplicate pending items."""
+        if self._settings.health_heartbeat_interval <= 0:
+            return
+        if self._health_pending.is_set():
+            return
+        self._health_pending.set()
+        self._queue.put(QueueItem("health", "", QueueItem.Action.HEALTH))
+
+    def _health_loop(self) -> None:
+        """Schedule heartbeats; the detector thread performs the actual publish."""
+        interval = self._settings.health_heartbeat_interval
+        if interval <= 0:
+            return
+        self._logger.log(f"Starting health heartbeat every {interval:g} seconds")
+        self._queue_health_check()
+        while not self._health_stop.wait(timeout=interval):
+            self._queue_health_check()
+
+    def start_health_monitor(self) -> None:
+        """Start the service health heartbeat scheduler."""
+        if self._settings.health_heartbeat_interval <= 0:
+            self._logger.log("Health heartbeat disabled", True)
+            return
+        self._health_thread = Thread(
+            target=self._health_loop,
+            name="health-heartbeat",
+            daemon=True,
+        )
+        self._health_thread.start()
+
+    def stop_health_monitor(self) -> None:
+        """Stop the service health heartbeat scheduler."""
+        self._health_stop.set()
+        if self._health_thread and self._health_thread.is_alive():
+            self._health_thread.join(timeout=2)
 
     def _device_slug(self, device: str) -> str:
         """Return the stable MQTT/HA slug used for a device."""
@@ -704,8 +831,10 @@ class PresenceDetector(Thread):
         self._logger.log("Stopping...")
         self.stop_watchers()
         self.stop_signal_poller()
+        self.stop_health_monitor()
         self._killed = True
         self._queue.put(QueueItem("quit", "", QueueItem.Action.QUIT))
+        self._publish_health(False)
         self._mqtt.disconnect()
         self._mqtt.loop_stop()
 
@@ -758,6 +887,7 @@ class PresenceDetector(Thread):
         self._do_full_sync()
         self.start_watchers()
         self.start_signal_poller()
+        self.start_health_monitor()
 
         mq_is_offline = False
         queue_timeout = (
@@ -780,6 +910,12 @@ class PresenceDetector(Thread):
             if item.action == QueueItem.Action.SYNC:
                 self._do_full_sync(republish_known=True)
                 self._signal_wakeup.set()
+                self._queue.task_done()
+                continue
+
+            if item.action == QueueItem.Action.HEALTH:
+                self._health_pending.clear()
+                self._publish_health(True)
                 self._queue.task_done()
                 continue
 
