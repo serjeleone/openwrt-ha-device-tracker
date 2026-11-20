@@ -320,7 +320,8 @@ class PresenceDetector(Thread):
             "device_class": "connectivity",
             "entity_category": "diagnostic",
             "expire_after": self._settings.health_expire_after,
-            "name": "Presence Detector",
+            "name": None,
+            "default_entity_id": f"binary_sensor.{health_slug}",
             "unique_id": health_slug,
             "device": {
                 "identifiers": [health_slug],
