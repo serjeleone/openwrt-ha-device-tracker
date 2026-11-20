@@ -333,6 +333,7 @@ class PresenceDetector(Thread):
         published = self._publish(
             f"homeassistant/binary_sensor/{health_slug}/config",
             json.dumps(body),
+            retain=True,
         )
         if published:
             self._health_registered = True
