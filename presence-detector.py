@@ -269,6 +269,9 @@ class PresenceDetector(Thread):
         self._mqtt.subscribe("homeassistant/status")
         self._signal_wakeup.set()
         self._queue_health_check()
+        # On a broker reconnect, discovery and retained states may have been
+        # lost. Rebuild them once instead of resetting discovery on every poll.
+        self._queue.put(QueueItem("sync", "", QueueItem.Action.SYNC))
 
     def _on_mqtt_connect_fail(self, _client, _userdata):
         """Callback for MQTT connection failures."""
@@ -926,26 +929,49 @@ class PresenceDetector(Thread):
         if devices is None:
             # A partial snapshot must not make clients from a failed AP go away.
             return
-        self._registered_clients = set()
         seen_now = set(devices)
         is_first_sync = self._last_seen_clients is None
-        away = (self._last_seen_clients or set()) - seen_now
         self._last_seen_clients = seen_now
 
-        for _interface, client in seen_now:
-            if self._should_handle_device(client):
-                self._known_clients.add(client)
+        # Compare against events already observed by the ubus watcher threads,
+        # not merely the previous periodic snapshot. Otherwise every fallback
+        # poll repeats home publications and RSSI wakeups for unchanged clients.
+        with self._clients_lock:
+            previously_online = {
+                (interface, client)
+                for interface, clients in self._online_clients.items()
+                for client in clients
+                if self._should_handle_device(client)
+            }
+        currently_online = {
+            (interface, client)
+            for interface, client in seen_now
+            if self._should_handle_device(client)
+        }
+        self._known_clients.update(client for _, client in currently_online)
 
-        for interface, client in seen_now:
-            if not away_only:
+        added = currently_online - previously_online
+        removed = previously_online - currently_online
+
+        # Add associations first so roaming between APs never causes a
+        # transient away state when the old association is then removed.
+        if not away_only:
+            for interface, client in sorted(added):
                 self.set_device_home(interface, client)
 
-        away_macs: set[str] = set()
-        for interface, client in away:
-            away_macs.add(client)
+        for interface, client in sorted(removed):
             self.set_device_away(interface, client)
 
+        # An HA/broker restart still requires republishing existing home
+        # states, but it does not require changing local presence or RSSI state.
+        if republish_known and not away_only:
+            for interface, client in sorted(currently_online - added):
+                self._queue.put(
+                    QueueItem(client, interface, QueueItem.Action.ADD)
+                )
+
         if is_first_sync or republish_known:
+            removed_macs = {client for _, client in removed}
             # Rebuild discovery/state for devices that are already away. This is
             # required after an HA restart because MQTT Discovery config messages
             # are not retained, and an already-away client generates no new
@@ -955,7 +981,7 @@ class PresenceDetector(Thread):
             for device in known_devices:
                 if (
                     device in seen_macs
-                    or device in away_macs
+                    or device in removed_macs
                     or not self._should_handle_device(device)
                 ):
                     continue
