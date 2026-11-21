@@ -905,7 +905,11 @@ class PresenceDetector(Thread):
         if self._settings.auto_detect_interfaces:
             try:
                 changed = self._settings.refresh_interfaces()
-            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as ex:
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as ex:
                 self._logger.log(f"Failed to refresh Wi-Fi interfaces: {ex}")
             else:
                 if changed:
