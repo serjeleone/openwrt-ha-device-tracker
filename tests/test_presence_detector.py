@@ -190,6 +190,7 @@ class PresenceDetectorRecoveryTests(unittest.TestCase):
     def test_explicit_ha_sync_republishes_home_and_away(self):
         detector = self._test_detector()
         away_mac = "b0:8c:75:1d:58:45"
+        detector._settings.allow_list.append(away_mac)
         detector._settings.params[away_mac] = {}
         detector._known_clients.add(away_mac)
         detector._do_full_sync(republish_known=True)
