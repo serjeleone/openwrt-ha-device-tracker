@@ -380,10 +380,8 @@ class PresenceDetector(Thread):
             retain=False,
         )
         if published and online != self._last_health_online:
-            self._logger.log(
-                "Presence Detector health: "
-                + ("online" if online else "offline (ubus watcher unavailable)")
-            )
+            status = "online" if online else "offline (ubus watcher unavailable)"
+            self._logger.log(f"Presence Detector health: {status}")
             self._last_health_online = online
         return published
 
@@ -975,9 +973,7 @@ class PresenceDetector(Thread):
 
         mq_is_offline = False
         sync_interval = self._settings.fallback_sync_interval
-        next_sync = (
-            time.monotonic() + sync_interval if sync_interval > 0 else None
-        )
+        next_sync = time.monotonic() + sync_interval if sync_interval > 0 else None
 
         while not self._killed:
             # A periodic deadline must not be postponed by frequent MQTT health
@@ -1072,6 +1068,7 @@ class UbusWatcher(Thread):
         while not self._stop_event.is_set():
             process: subprocess.Popen[str] | None = None
             try:
+                # pylint: disable=consider-using-with
                 process = subprocess.Popen(
                     ["ubus", "subscribe", self._interface],
                     stdout=subprocess.PIPE,
@@ -1099,15 +1096,11 @@ class UbusWatcher(Thread):
                         if isinstance(assoc, dict) and isinstance(
                             assoc.get("address"), str
                         ):
-                            self._on_join(
-                                self._interface, assoc["address"].lower()
-                            )
+                            self._on_join(self._interface, assoc["address"].lower())
                         elif isinstance(disassoc, dict) and isinstance(
                             disassoc.get("address"), str
                         ):
-                            self._on_leave(
-                                self._interface, disassoc["address"].lower()
-                            )
+                            self._on_leave(self._interface, disassoc["address"].lower())
             except OSError as ex:
                 self._logger.log(
                     f"Failed to subscribe to ubus interface {self._interface}: {ex}"
