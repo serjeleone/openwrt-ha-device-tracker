@@ -266,6 +266,12 @@ class PresenceDetector(Thread):
             self._logger.log(f"MQTT broker connection failed (rc: {reason_code})")
             return
         self._logger.log("MQTT broker connected")
+        # Rebuild Discovery after the initial connection as well as reconnects:
+        # publications attempted before the broker was ready may have failed.
+        self._registered_clients.clear()
+        self._registered_signal_clients.clear()
+        self._health_registered = False
+        self._clear_signal_publish_cache()
         self._mqtt.subscribe("homeassistant/status")
         self._signal_wakeup.set()
         self._queue_health_check()
