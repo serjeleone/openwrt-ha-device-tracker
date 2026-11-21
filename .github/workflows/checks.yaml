@@ -25,6 +25,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements-dev.txt
 
+    - name: Run recovery regression tests
+      run: python -m unittest discover -s tests -v
+
     - name: Check formatting with black
       run: black --check presence-detector.py
 

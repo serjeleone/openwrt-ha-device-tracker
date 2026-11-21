@@ -75,7 +75,7 @@ These settings will need a bit of explaining:
 * mqtt_username: The username to use for authentication to the MQTT broker.
 * mqtt_password: The password to use for authentication to the MQTT broker.
 * mqtt_retain_state: Whether to set the 'retain' flag on MQTT state messages. This ensures that the device state is remembered by the MQTT broker and immediately available to Home Assistant when it connects. Default: true
-* interfaces: A list of Wi-Fi interfaces to monitor. Leave this unset (or an empty list) to auto-detect and monitor all WiFi interfaces.
+* interfaces: A list of Wi-Fi interfaces to monitor. Leave this unset (or an empty list) to auto-detect hostapd interfaces. With fallback sync enabled, the detector refreshes the interface list on every sync, starts watchers for newly available APs, and reconnects watchers if ubus exits.
 * allow_list: A list of MAC addresses to track. When the list is non-empty, only these clients get a `device_tracker` and RSSI sensors. An empty list (`[]`) tracks all Wi-Fi clients. MAC matching is case-insensitive.
 * params: An optional dictionary containing additional parameters for specific devices (see the example above).
 If specified, these are sent to HA together with the MAC address and location name. For information on which keys you can add, see [here](https://www.home-assistant.io/integrations/device_tracker.mqtt/#device_tracker-mqtt-configuration-variables).
@@ -84,10 +84,12 @@ For info on how these params appear in HA see [below](#optional-home-assistant-c
 * location: Custom location name to be assigned to online devices. Default: "home"
 * away: Custom location name to be sent when a device is no longer connected. Default: "not_home"
 * fallback_sync_interval: Interval in seconds to perform a full sync of online/offline devices to HA. Enable this as a fallback option if you have issues with devices not being detected as 'offline' when they go out of WiFi range.
-**NOTE**: this will perform a 'ubus get clients' call every X seconds, which could increase load on the router. Default 0 (disabled)
-* signal_poll_interval: Interval in seconds for local `iwinfo assoclist` polling used to publish current (`signal`) and average (`signal_avg`) RSSI through MQTT. Default: 5. Set to 0 to disable the RSSI sensors.
+**NOTE**: this runs on a monotonic schedule, independently of MQTT heartbeat or client events. It performs a 'ubus get clients' call every X seconds, which could increase router load. Default: 60 seconds; set 0 to disable fallback sync (and periodic auto-discovery of new interfaces).
+* signal_poll_interval: Interval in seconds for local `iw dev <interface> station dump` polling used to publish current and average RSSI through MQTT. Default: 2. Set to 0 to disable the RSSI sensors.
 * source_type: This is the type of device that gets sent to HA to represent the tracking device. It defaults to 'router', but can also be set to 'gps' to allow for different zones/locations to work.
 * debug: Enable or disable debugging (prints state information on stdout when enabled). Default: false
+
+The Presence Detector MQTT health binary sensor reports `offline` if any expected ubus subscription is missing, even when the Python process and MQTT connection are still running. It reports `online` again after all expected subscriptions recover.
 
 For more details about the RSSI sensors, availability handling and roaming behavior, see [README-RSSI.md](README-RSSI.md).
 
