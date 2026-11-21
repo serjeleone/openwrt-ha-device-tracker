@@ -106,8 +106,13 @@ class Settings:
         if self._settings["health_expire_after"] < 1:
             self._settings["health_expire_after"] = 30
 
-        if not self._settings["interfaces"]:
-            self._settings["interfaces"] = self.list_wifi_interfaces()
+        self.auto_detect_interfaces = not bool(self._settings["interfaces"])
+        if self.auto_detect_interfaces:
+            try:
+                self._settings["interfaces"] = self.list_wifi_interfaces()
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                # Hostapd/ubus may still be starting; retry during periodic sync.
+                self._settings["interfaces"] = []
 
     def __getattr__(self, item: str) -> Any:
         return self._settings.get(item)
@@ -115,9 +120,23 @@ class Settings:
     def list_wifi_interfaces(self) -> list[str]:
         """List all hostapd Wi-Fi ubus interfaces."""
         output = subprocess.run(
-            ["ubus", "list", "hostapd.*"], stdout=subprocess.PIPE, check=True
+            ["ubus", "list", "hostapd.*"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
         )
-        return output.stdout.decode("utf-8").strip().split("\n")
+        return [line.strip() for line in output.stdout.splitlines() if line.strip()]
+
+    def refresh_interfaces(self) -> bool:
+        """Refresh auto-discovered hostapd interfaces; report whether they changed."""
+        if not self.auto_detect_interfaces:
+            return False
+        interfaces = self.list_wifi_interfaces()
+        if interfaces == self._settings["interfaces"]:
+            return False
+        self._settings["interfaces"] = interfaces
+        return True
 
     @staticmethod
     def deep_merge(dict1: dict, dict2: dict):
@@ -179,7 +198,7 @@ class PresenceDetector(Thread):
         self._settings = Settings(config_file)
         self._logger = Logger(self._settings.debug)
         self._queue: Queue = Queue()
-        self._watchers: list[UbusWatcher] = []
+        self._watchers: dict[str, UbusWatcher] = {}
         self._killed = False
         self._last_seen_clients: set[tuple[str, str]] | None = None
         self._online_clients: dict[str, set[str]] = {}
@@ -195,6 +214,7 @@ class PresenceDetector(Thread):
         self._signal_wakeup = Event()
         self._signal_thread: Thread | None = None
         self._health_registered = False
+        self._last_health_online: bool | None = None
         self._health_stop = Event()
         self._health_pending = Event()
         self._health_thread: Thread | None = None
@@ -339,17 +359,33 @@ class PresenceDetector(Thread):
             self._health_registered = True
         return published
 
+    def _watchers_healthy(self) -> bool:
+        """Require an active ubus subscription for every monitored interface."""
+        interfaces = self._settings.interfaces
+        return bool(interfaces) and all(
+            interface in self._watchers and self._watchers[interface].is_subscribed
+            for interface in interfaces
+        )
+
     def _publish_health(self, online: bool = True) -> bool:
-        """Publish service health from the detector's main working thread."""
+        """Publish health only when the detector and its ubus watchers are healthy."""
         if self._settings.health_heartbeat_interval <= 0:
             return True
         if online and not self._register_health_sensor():
             return False
-        return self._publish(
+        online = online and self._watchers_healthy()
+        published = self._publish(
             self._health_state_topic(),
             "online" if online else "offline",
             retain=False,
         )
+        if published and online != self._last_health_online:
+            self._logger.log(
+                "Presence Detector health: "
+                + ("online" if online else "offline (ubus watcher unavailable)")
+            )
+            self._last_health_online = online
+        return published
 
     def _queue_health_check(self) -> None:
         """Queue one health heartbeat without allowing duplicate pending items."""
@@ -638,8 +674,9 @@ class PresenceDetector(Thread):
                     capture_output=True,
                     text=True,
                     check=False,
+                    timeout=5,
                 )
-            except OSError as ex:
+            except (OSError, subprocess.TimeoutExpired) as ex:
                 self._logger.log(
                     f"Error running iw for {wireless_interface}: {ex}"
                 )
@@ -778,27 +815,35 @@ class PresenceDetector(Thread):
             f"Device {device} on {interface} is now at {self._settings.location}"
         )
 
-    def _get_all_online_devices(self) -> list[tuple[str, str]]:
-        """Call ubus and get all online devices."""
-        devices = []
+    def _get_all_online_devices(self) -> list[tuple[str, str]] | None:
+        """Return a complete ubus snapshot, or None if any interface fails."""
+        devices: list[tuple[str, str]] = []
         for interface in self._settings.interfaces:
-            process = subprocess.run(
-                ["ubus", "call", interface, "get_clients"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            try:
+                process = subprocess.run(
+                    ["ubus", "call", interface, "get_clients"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired) as ex:
+                self._logger.log(f"Error running ubus for {interface}: {ex}")
+                return None
             if process.returncode != 0:
                 self._logger.log(
                     f"Error running ubus for interface {interface}: {process.stderr}"
                 )
-                continue
+                return None
             try:
                 response: dict = json.loads(process.stdout)
-            except json.JSONDecodeError as ex:
+                clients = response["clients"]
+                if not isinstance(clients, dict):
+                    raise ValueError("clients is not a dictionary")
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as ex:
                 self._logger.log(f"Invalid ubus response for {interface}: {ex}")
-                continue
-            devices.extend([(interface, key.lower()) for key in response.get("clients", {})])
+                return None
+            devices.extend((interface, key.lower()) for key in clients)
         return devices
 
     def _should_handle_device(self, device: str) -> bool:
@@ -809,19 +854,34 @@ class PresenceDetector(Thread):
         return device in self._settings.allow_list
 
     def start_watchers(self) -> None:
-        """Start ubus watcher threads for every interface."""
-        self._logger.log(
-            f"Starting ubus watchers on interfaces {self._settings.interfaces}"
-        )
+        """Start ubus watchers for the currently discovered interfaces."""
+        self._refresh_watchers()
+
+    def _refresh_watchers(self) -> None:
+        """Reconcile watchers with hostapd interfaces, replacing dead threads."""
+        interfaces = set(self._settings.interfaces)
+        for interface, watcher in list(self._watchers.items()):
+            if interface not in interfaces or not watcher.is_alive():
+                watcher.stop()
+                if watcher.is_alive():
+                    watcher.join(timeout=2)
+                del self._watchers[interface]
+
         for interface in self._settings.interfaces:
-            watcher = UbusWatcher(interface, self.set_device_home, self.set_device_away)
-            watcher.start()
-            self._watchers.append(watcher)
+            if interface not in self._watchers:
+                watcher = UbusWatcher(
+                    interface, self.set_device_home, self.set_device_away, self._logger
+                )
+                watcher.start()
+                self._watchers[interface] = watcher
+                self._logger.log(f"Started ubus watcher for {interface}")
 
     def stop_watchers(self) -> None:
-        """Signal all ubus watchers to stop."""
-        for watcher in self._watchers:
+        """Stop all ubus watcher processes and threads."""
+        for watcher in self._watchers.values():
             watcher.stop()
+        for watcher in self._watchers.values():
+            watcher.join(timeout=2)
 
     @property
     def stopped(self):
@@ -842,8 +902,26 @@ class PresenceDetector(Thread):
 
     def _do_full_sync(self, away_only=False, republish_known=False):
         """Perform a full sync of current devices and optionally rebuild HA state."""
+        if self._settings.auto_detect_interfaces:
+            try:
+                changed = self._settings.refresh_interfaces()
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as ex:
+                self._logger.log(f"Failed to refresh Wi-Fi interfaces: {ex}")
+            else:
+                if changed:
+                    self._logger.log(
+                        f"Wi-Fi interfaces changed: {self._settings.interfaces}"
+                    )
+                    with self._clients_lock:
+                        for interface in self._settings.interfaces:
+                            self._online_clients.setdefault(interface, set())
+
+        devices = self._get_all_online_devices()
+        if devices is None:
+            # A partial snapshot must not make clients from a failed AP go away.
+            return
         self._registered_clients = set()
-        seen_now = set(self._get_all_online_devices())
+        seen_now = set(devices)
         is_first_sync = self._last_seen_clients is None
         away = (self._last_seen_clients or set()) - seen_now
         self._last_seen_clients = seen_now
@@ -892,17 +970,27 @@ class PresenceDetector(Thread):
         self.start_health_monitor()
 
         mq_is_offline = False
-        queue_timeout = (
-            self._settings.fallback_sync_interval
-            if self._settings.fallback_sync_interval > 0
-            else None
+        sync_interval = self._settings.fallback_sync_interval
+        next_sync = (
+            time.monotonic() + sync_interval if sync_interval > 0 else None
         )
 
         while not self._killed:
+            # A periodic deadline must not be postponed by frequent MQTT health
+            # messages, RSSI activity, or continuous ubus client events.
+            if next_sync is not None and time.monotonic() >= next_sync:
+                self._do_full_sync()
+                self._refresh_watchers()
+                next_sync = time.monotonic() + sync_interval
+
+            queue_timeout = (
+                max(0, next_sync - time.monotonic())
+                if next_sync is not None
+                else None
+            )
             try:
                 item: QueueItem = self._queue.get(timeout=queue_timeout)
             except queue.Empty:
-                self._do_full_sync()
                 continue
 
             if item.action == QueueItem.Action.QUIT:
@@ -936,54 +1024,112 @@ class PresenceDetector(Thread):
 
 
 class UbusWatcher(Thread):
-    """Watches live ubus events and signals presence detector of leave/join events."""
+    """Watch hostapd events and reconnect if the ubus subscription exits."""
 
     def __init__(
         self,
         interface: str,
         on_join: Callable[[str, str], None],
         on_leave: Callable[[str, str], None],
+        logger: Logger,
     ) -> None:
-        super().__init__()
+        super().__init__(name=f"ubus-{interface}", daemon=True)
         self._on_join = on_join
         self._on_leave = on_leave
         self._interface = interface
-        self._killed = False
+        self._logger = logger
+        self._stop_event = Event()
+        self._subscribed = Event()
+        self._process: subprocess.Popen[str] | None = None
 
-    def stop(self):
-        """Stop this watcher thread."""
-        self._killed = True
+    @property
+    def is_subscribed(self) -> bool:
+        """True only while a live ubus subscribe process is attached."""
+        process = self._process
+        return (
+            self.is_alive()
+            and self._subscribed.is_set()
+            and process is not None
+            and process.poll() is None
+        )
+
+    def stop(self) -> None:
+        """Interrupt a blocking readline by terminating its ubus process."""
+        self._stop_event.set()
+        process = self._process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
 
     def run(self) -> None:
-        """Main loop for the ubus event watcher thread."""
-        while not self._killed:
-            # pylint: disable=consider-using-with
-            ubus = subprocess.Popen(
-                ["ubus", "subscribe", self._interface],
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-            time.sleep(1)
-            return_code = ubus.poll()
-            if return_code is not None or ubus.stdout is None:
-                ubus.wait()
-                continue
+        """Reopen subscriptions after EOF or ubus/hostapd restarts."""
+        while not self._stop_event.is_set():
+            process: subprocess.Popen[str] | None = None
+            try:
+                process = subprocess.Popen(
+                    ["ubus", "subscribe", self._interface],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                self._process = process
+                if process.poll() is None:
+                    self._subscribed.set()
 
-            while not self._killed:
-                line = ubus.stdout.readline()
-                event = {}
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    pass
-                if "assoc" in event:
-                    self._on_join(self._interface, event["assoc"]["address"].lower())
-                elif "disassoc" in event:
-                    self._on_leave(
-                        self._interface, event["disassoc"]["address"].lower()
-                    )
-            ubus.terminate()
-            ubus.wait()
+                if process.stdout is not None:
+                    while not self._stop_event.is_set():
+                        line = process.stdout.readline()
+                        if not line:
+                            # EOF: avoid looping forever on an exited child.
+                            break
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        assoc = event.get("assoc")
+                        disassoc = event.get("disassoc")
+                        if isinstance(assoc, dict) and isinstance(
+                            assoc.get("address"), str
+                        ):
+                            self._on_join(
+                                self._interface, assoc["address"].lower()
+                            )
+                        elif isinstance(disassoc, dict) and isinstance(
+                            disassoc.get("address"), str
+                        ):
+                            self._on_leave(
+                                self._interface, disassoc["address"].lower()
+                            )
+            except OSError as ex:
+                self._logger.log(
+                    f"Failed to subscribe to ubus interface {self._interface}: {ex}"
+                )
+            finally:
+                self._subscribed.clear()
+                if process is not None:
+                    if process.poll() is None:
+                        try:
+                            process.terminate()
+                        except OSError:
+                            pass
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+                    if process.stdout is not None:
+                        process.stdout.close()
+                self._process = None
+
+            if not self._stop_event.is_set():
+                self._logger.log(
+                    f"ubus subscription for {self._interface} ended; retrying"
+                )
+            self._stop_event.wait(2)
 
 
 def main():
