@@ -84,7 +84,7 @@ For info on how these params appear in HA see [below](#optional-home-assistant-c
 * location: Custom location name to be assigned to online devices. Default: "home"
 * away: Custom location name to be sent when a device is no longer connected. Default: "not_home"
 * fallback_sync_interval: Interval in seconds to perform a full sync of online/offline devices to HA. Enable this as a fallback option if you have issues with devices not being detected as 'offline' when they go out of WiFi range.
-**NOTE**: this runs on a monotonic schedule, independently of MQTT heartbeat or client events. It performs a 'ubus get clients' call every X seconds, which could increase router load. Default: 60 seconds; set 0 to disable fallback sync (and periodic auto-discovery of new interfaces).
+**NOTE**: this runs on a monotonic schedule, independently of MQTT heartbeat or client events. It performs a 'ubus get clients' call every X seconds, which could increase router load. The result is compared with the state already tracked by live ubus events; unchanged clients do not cause repeated MQTT state or Discovery messages, or RSSI polling wakeups. Default: 60 seconds; set 0 to disable fallback sync (and periodic auto-discovery of new interfaces).
 * signal_poll_interval: Interval in seconds for local `iw dev <interface> station dump` polling used to publish current and average RSSI through MQTT. Default: 2. Set to 0 to disable the RSSI sensors.
 * source_type: This is the type of device that gets sent to HA to represent the tracking device. It defaults to 'router', but can also be set to 'gps' to allow for different zones/locations to work.
 * debug: Enable or disable debugging (prints state information on stdout when enabled). Default: false
