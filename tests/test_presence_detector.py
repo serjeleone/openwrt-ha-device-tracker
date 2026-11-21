@@ -208,9 +208,16 @@ class PresenceDetectorRecoveryTests(unittest.TestCase):
     def test_mqtt_connect_queues_explicit_resync(self):
         detector = self._test_detector()
         detector._mqtt = Mock()
+        detector._registered_signal_clients = {"old_signal"}
+        detector._health_registered = True
+        detector._clear_signal_publish_cache = Mock()
         detector._queue_health_check = Mock()
         detector._on_mqtt_connect(None, None, None, 0)
         detector._mqtt.subscribe.assert_called_once_with("homeassistant/status")
+        self.assertFalse(detector._registered_clients)
+        self.assertFalse(detector._registered_signal_clients)
+        self.assertFalse(detector._health_registered)
+        detector._clear_signal_publish_cache.assert_called_once()
         detector._signal_wakeup.set.assert_called_once()
         item = detector._queue.put.call_args.args[0]
         self.assertEqual(item.action, MODULE.QueueItem.Action.SYNC)
