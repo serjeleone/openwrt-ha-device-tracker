@@ -921,21 +921,10 @@ class PresenceDetector(Thread):
                 for interface in self._settings.interfaces:
                     self._online_clients.setdefault(interface, set())
 
-    def _do_full_sync(self, away_only=False, republish_known=False):
-        """Perform a full sync of current devices and optionally rebuild HA state."""
-        self._refresh_interfaces()
-
-        devices = self._get_all_online_devices()
-        if devices is None:
-            # A partial snapshot must not make clients from a failed AP go away.
-            return
-        seen_now = set(devices)
-        is_first_sync = self._last_seen_clients is None
-        self._last_seen_clients = seen_now
-
-        # Compare against events already observed by the ubus watcher threads,
-        # not merely the previous periodic snapshot. Otherwise every fallback
-        # poll repeats home publications and RSSI wakeups for unchanged clients.
+    def _reconcile_clients(
+        self, seen_now: set[tuple[str, str]], away_only: bool, republish_known: bool
+    ) -> set[str]:
+        """Apply only missing presence transitions, returning newly away MACs."""
         with self._clients_lock:
             previously_online = {
                 (interface, client)
@@ -953,8 +942,7 @@ class PresenceDetector(Thread):
         added = currently_online - previously_online
         removed = previously_online - currently_online
 
-        # Add associations first so roaming between APs never causes a
-        # transient away state when the old association is then removed.
+        # Add associations first to avoid reporting away during Wi-Fi roaming.
         if not away_only:
             for interface, client in sorted(added):
                 self.set_device_home(interface, client)
@@ -962,21 +950,32 @@ class PresenceDetector(Thread):
         for interface, client in sorted(removed):
             self.set_device_away(interface, client)
 
-        # An HA/broker restart still requires republishing existing home
-        # states, but it does not require changing local presence or RSSI state.
+        # Explicit HA/MQTT resync must still republish unchanged home devices,
+        # but should not change the local Wi-Fi state or wake RSSI unnecessarily.
         if republish_known and not away_only:
             for interface, client in sorted(currently_online - added):
-                self._queue.put(
-                    QueueItem(client, interface, QueueItem.Action.ADD)
-                )
+                self._queue.put(QueueItem(client, interface, QueueItem.Action.ADD))
+
+        return {client for _, client in removed}
+
+    def _do_full_sync(self, away_only=False, republish_known=False):
+        """Reconcile the ubus snapshot without repeating unchanged MQTT states."""
+        self._refresh_interfaces()
+
+        devices = self._get_all_online_devices()
+        if devices is None:
+            # A partial snapshot must not make clients from a failed AP go away.
+            return
+        seen_now = set(devices)
+        is_first_sync = self._last_seen_clients is None
+        self._last_seen_clients = seen_now
+        removed_macs = self._reconcile_clients(
+            seen_now, away_only=away_only, republish_known=republish_known
+        )
 
         if is_first_sync or republish_known:
-            removed_macs = {client for _, client in removed}
-            # Rebuild discovery/state for devices that are already away. This is
-            # required after an HA restart because MQTT Discovery config messages
-            # are not retained, and an already-away client generates no new
-            # disassoc event to recreate its entity/state.
-            seen_macs = {client for _interface, client in seen_now}
+            # Rebuild discovery/state for devices that are already away.
+            seen_macs = {client for _, client in seen_now}
             known_devices = set(self._known_clients) | set(self._settings.params.keys())
             for device in known_devices:
                 if (
@@ -990,8 +989,7 @@ class PresenceDetector(Thread):
                 )
                 self._queue.put(QueueItem(device, "", QueueItem.Action.DELETE))
 
-            # RSSI discovery/state is rebuilt by the signal poller, outside the
-            # MQTT callback thread.
+            # Force RSSI cache rediscovery after HA restart or on first sync.
             self._signal_wakeup.set()
 
     def run(self) -> None:
