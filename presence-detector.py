@@ -898,25 +898,29 @@ class PresenceDetector(Thread):
         self._mqtt.disconnect()
         self._mqtt.loop_stop()
 
+    def _refresh_interfaces(self) -> None:
+        """Refresh auto-detected APs and initialize client state for new ones."""
+        if not self._settings.auto_detect_interfaces:
+            return
+        try:
+            changed = self._settings.refresh_interfaces()
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as ex:
+            self._logger.log(f"Failed to refresh Wi-Fi interfaces: {ex}")
+            return
+
+        if changed:
+            self._logger.log(f"Wi-Fi interfaces changed: {self._settings.interfaces}")
+            with self._clients_lock:
+                for interface in self._settings.interfaces:
+                    self._online_clients.setdefault(interface, set())
+
     def _do_full_sync(self, away_only=False, republish_known=False):
         """Perform a full sync of current devices and optionally rebuild HA state."""
-        if self._settings.auto_detect_interfaces:
-            try:
-                changed = self._settings.refresh_interfaces()
-            except (
-                OSError,
-                subprocess.CalledProcessError,
-                subprocess.TimeoutExpired,
-            ) as ex:
-                self._logger.log(f"Failed to refresh Wi-Fi interfaces: {ex}")
-            else:
-                if changed:
-                    self._logger.log(
-                        f"Wi-Fi interfaces changed: {self._settings.interfaces}"
-                    )
-                    with self._clients_lock:
-                        for interface in self._settings.interfaces:
-                            self._online_clients.setdefault(interface, set())
+        self._refresh_interfaces()
 
         devices = self._get_all_online_devices()
         if devices is None:
@@ -1063,6 +1067,39 @@ class UbusWatcher(Thread):
             except OSError:
                 pass
 
+    def _handle_event(self, line: str) -> None:
+        """Pass a valid hostapd association event to the detector."""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        assoc = event.get("assoc")
+        disassoc = event.get("disassoc")
+        if isinstance(assoc, dict) and isinstance(assoc.get("address"), str):
+            self._on_join(self._interface, assoc["address"].lower())
+        elif isinstance(disassoc, dict) and isinstance(
+            disassoc.get("address"), str
+        ):
+            self._on_leave(self._interface, disassoc["address"].lower())
+
+    @staticmethod
+    def _close_process(process: subprocess.Popen[str]) -> None:
+        """Terminate and reap a subscription process without leaving zombies."""
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        if process.stdout is not None:
+            process.stdout.close()
+
     def run(self) -> None:
         """Reopen subscriptions after EOF or ubus/hostapd restarts."""
         while not self._stop_event.is_set():
@@ -1085,22 +1122,7 @@ class UbusWatcher(Thread):
                         if not line:
                             # EOF: avoid looping forever on an exited child.
                             break
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(event, dict):
-                            continue
-                        assoc = event.get("assoc")
-                        disassoc = event.get("disassoc")
-                        if isinstance(assoc, dict) and isinstance(
-                            assoc.get("address"), str
-                        ):
-                            self._on_join(self._interface, assoc["address"].lower())
-                        elif isinstance(disassoc, dict) and isinstance(
-                            disassoc.get("address"), str
-                        ):
-                            self._on_leave(self._interface, disassoc["address"].lower())
+                        self._handle_event(line)
             except OSError as ex:
                 self._logger.log(
                     f"Failed to subscribe to ubus interface {self._interface}: {ex}"
@@ -1108,18 +1130,7 @@ class UbusWatcher(Thread):
             finally:
                 self._subscribed.clear()
                 if process is not None:
-                    if process.poll() is None:
-                        try:
-                            process.terminate()
-                        except OSError:
-                            pass
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=2)
-                    if process.stdout is not None:
-                        process.stdout.close()
+                    self._close_process(process)
                 self._process = None
 
             if not self._stop_event.is_set():
