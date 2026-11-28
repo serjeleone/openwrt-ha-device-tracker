@@ -2,8 +2,12 @@
 
 import importlib.util
 import json
+import os
+import select
+import signal
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -306,6 +310,107 @@ class PresenceDetectorRecoveryTests(unittest.TestCase):
         detector._signal_wakeup.set.assert_called_once()
         item = detector._queue.put.call_args.args[0]
         self.assertEqual(item.action, MODULE.QueueItem.Action.SYNC)
+
+    def test_parent_bound_ubus_registers_death_signal_before_exec(self):
+        library = Mock()
+        library.prctl.return_value = 0
+        with (
+            patch.object(MODULE.os, "getppid", return_value=123),
+            patch.object(MODULE.ctypes, "CDLL", return_value=library),
+            patch.object(MODULE.os, "execvp") as execute,
+        ):
+            MODULE._exec_parent_bound_ubus("hostapd.test", 123)
+        library.prctl.assert_called_once_with(1, signal.SIGKILL, 0, 0, 0)
+        execute.assert_called_once_with(
+            "ubus", ["ubus", "subscribe", "hostapd.test"]
+        )
+
+    def test_parent_bound_ubus_aborts_if_parent_dies_before_exec(self):
+        library = Mock()
+        library.prctl.return_value = 0
+        with (
+            patch.object(MODULE.os, "getppid", side_effect=[123, 1]),
+            patch.object(MODULE.ctypes, "CDLL", return_value=library),
+            patch.object(MODULE.os, "execvp") as execute,
+        ):
+            with self.assertRaises(SystemExit):
+                MODULE._exec_parent_bound_ubus("hostapd.test", 123)
+        execute.assert_not_called()
+
+    def test_parent_bound_ubus_aborts_if_prctl_fails(self):
+        library = Mock()
+        library.prctl.return_value = -1
+        with (
+            patch.object(MODULE.os, "getppid", return_value=123),
+            patch.object(MODULE.ctypes, "CDLL", return_value=library),
+            patch.object(MODULE.ctypes, "get_errno", return_value=22),
+            patch.object(MODULE.os, "execvp") as execute,
+        ):
+            with self.assertRaises(OSError):
+                MODULE._exec_parent_bound_ubus("hostapd.test", 123)
+        execute.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux prctl required")
+    def test_subscription_dies_after_parent_sigkill(self):
+        # Fake ubus acknowledges exec and then remains idle like a subscription.
+        # The launcher runs in a separate process so it can really be SIGKILLed.
+        with tempfile.TemporaryDirectory() as folder:
+            fake = Path(folder) / "ubus"
+            fake.write_text("#!/bin/sh\nprintf 'ready\\n'\nexec sleep 300\n")
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=folder + ":" + os.environ["PATH"])
+            launcher = """
+import os, subprocess, sys, threading, time
+
+def watch():
+    child = subprocess.Popen(
+        [sys.executable, sys.argv[1], "--ubus-subscribe", "hostapd.test",
+         str(os.getpid())],
+        stdout=subprocess.PIPE, text=True,
+    )
+    if child.stdout.readline().strip() != "ready":
+        raise SystemExit(1)
+    print(child.pid, flush=True)
+    time.sleep(300)
+
+threading.Thread(target=watch).start()
+"""
+            with subprocess.Popen(
+                [sys.executable, "-c", launcher, str(SOURCE)],
+                env=env,
+                stdout=subprocess.PIPE,
+                text=True,
+            ) as parent:
+                child_pid = None
+                try:
+                    self.assertTrue(select.select([parent.stdout], [], [], 5)[0])
+                    child_pid = int(parent.stdout.readline())
+                    status = Path(f"/proc/{child_pid}/status")
+                    parent.kill()
+                    parent.wait(timeout=5)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        try:
+                            if "State:\tZ" in status.read_text():
+                                break
+                        except FileNotFoundError:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        self.fail("ubus child survived parent SIGKILL")
+                finally:
+                    if parent.poll() is None:
+                        parent.kill()
+                        parent.wait(timeout=5)
+                    if child_pid is not None:
+                        try:
+                            # A zombie is already dead; avoid signalling it.
+                            if "State:\tZ" not in status.read_text():
+                                os.kill(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        except FileNotFoundError:
+                            pass
 
     def test_ubus_watcher_resubscribes_after_eof(self):
         join = Mock()

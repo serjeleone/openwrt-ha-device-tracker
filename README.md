@@ -31,7 +31,7 @@ This fork also publishes current and average Wi-Fi signal strength through MQTT 
 * Make presence-detector.py executable: chmod +x presence-detector.py
 * Place the init-script from this repo's init.d directory into /etc/init.d on your device
 * Make the init-script executable: chmod +x /etc/init.d/presence-detector
-* Install python + deps: `apk update && apk add python3-light python3-paho-mqtt python3-codecs python3-urllib python3-logging rpcd-mod-iwinfo`.
+* Install python + deps: `apk update && apk add python3-light python3-ctypes python3-paho-mqtt python3-codecs python3-urllib python3-logging rpcd-mod-iwinfo`.
 * Adjust /etc/config/presence-detector.settings.json to your needs (see below)
 * run 'service presence-detector enable' to enable the service at startup
 * run 'service presence-detector start', or simply reboot
@@ -95,7 +95,7 @@ For more details about the RSSI sensors, availability handling and roaming behav
 
 ### Local procd watchdog
 
-The provided init script enables the per-instance watchdog on OpenWrt versions that support it. It passes `--procd-watchdog` to Python and sets `procd_set_param watchdog 1 60`. The detector feeds the local timer at most every 10 seconds from its actual working thread, including after bounded MQTT operations that fail. It also requires recent RSSI worker progress when RSSI polling is enabled; the RSSI freshness threshold is at least 30 seconds (or the configured poll interval plus 10 seconds). There is no additional watchdog daemon and no dependency on MQTT or Home Assistant being reachable. The ubus watchers retain their existing reconnect behavior.
+The provided init script enables the per-instance watchdog on OpenWrt versions that support it. It passes `--procd-watchdog` to Python and sets `procd_set_param watchdog 1 60`. The detector feeds the local timer at most every 10 seconds from its actual working thread, including after bounded MQTT operations that fail. It also requires recent RSSI worker progress when RSSI polling is enabled; the RSSI freshness threshold is at least 30 seconds (or the configured poll interval plus 10 seconds). There is no additional watchdog daemon and no dependency on MQTT or Home Assistant being reachable. The ubus watchers retain their existing reconnect behavior. Each subscription is launched with Linux `PR_SET_PDEATHSIG` through Python `ctypes`, then the temporary Python launcher replaces itself with `ubus`. The kernel kills the subscription when its creating thread or detector process dies, even after SIGKILL. This requires the OpenWrt `python3-ctypes` package if ctypes is not already installed; there is no additional persistent process.
 
 After 60 seconds without a feed, procd restarts the service, allowing 15 seconds for termination before force-killing it. The timer is independent of the MQTT health sensor. Detection of an RSSI-only stall also includes the RSSI freshness threshold. The init script keeps normal crash respawn limits (3600/5/5). Because watchdog-triggered restarts bypass that counter, Python permits at most four starts within a rolling 10-minute window, stored in RAM at `/var/run/presence-detector-watchdog.json`. This limit also includes manual starts. If exhausted, Python exits and procd's normal crash-loop limit applies. After fixing the cause, an administrator can stop the service, remove that file and start it again. No persistent flash writes are required by the watchdog.
 

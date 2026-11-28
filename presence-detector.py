@@ -10,11 +10,13 @@ MQTT Discovery.
 """
 
 import argparse
+import ctypes
 import json
 import os
 import queue
 import signal
 import subprocess
+import sys
 import syslog
 import time
 from dataclasses import dataclass
@@ -1177,6 +1179,30 @@ class PresenceDetector(Thread):
             self._queue.task_done()
 
 
+def _exec_parent_bound_ubus(interface: str, parent_pid: int) -> None:
+    """Bind the subscription to its creating thread, then replace this process."""
+    # Run this in a fresh interpreter, not in Popen(preexec_fn=...), which
+    # can deadlock after fork in a multithreaded detector.
+    if os.getppid() != parent_pid:
+        raise SystemExit(1)
+
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    prctl.restype = ctypes.c_int
+    pr_set_pdeathsig = 1  # Linux PR_SET_PDEATHSIG
+    if prctl(pr_set_pdeathsig, signal.SIGKILL, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+    # Close the race where the detector dies before prctl has been called.
+    if os.getppid() != parent_pid:
+        raise SystemExit(1)
+
+    # The parent-death signal survives exec of the ordinary ubus binary.
+    # No Python helper or additional monitoring process remains running.
+    os.execvp("ubus", ["ubus", "subscribe", interface])
+
+
 class UbusWatcher(Thread):
     """Watch hostapd events and reconnect if the ubus subscription exits."""
 
@@ -1257,7 +1283,13 @@ class UbusWatcher(Thread):
             try:
                 # pylint: disable=consider-using-with
                 process = subprocess.Popen(
-                    ["ubus", "subscribe", self._interface],
+                    [
+                        sys.executable,
+                        os.path.abspath(__file__),
+                        "--ubus-subscribe",
+                        self._interface,
+                        str(os.getpid()),
+                    ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     text=True,
@@ -1304,7 +1336,17 @@ def main():
         action="store_true",
         help="Feed the presence-detector procd instance watchdog",
     )
+    parser.add_argument("--ubus-subscribe", nargs=2, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.ubus_subscribe:
+        interface, parent_pid = args.ubus_subscribe
+        try:
+            _exec_parent_bound_ubus(interface, int(parent_pid))
+        except (OSError, ValueError) as ex:
+            Logger(False).log(f"Failed to start protected ubus subscription: {ex}")
+            raise SystemExit(1) from ex
+        return
 
     if args.procd_watchdog:
         logger = Logger(False)
