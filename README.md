@@ -93,6 +93,14 @@ The Presence Detector MQTT health binary sensor reports `offline` if any expecte
 
 For more details about the RSSI sensors, availability handling and roaming behavior, see [README-RSSI.md](README-RSSI.md).
 
+### Local procd watchdog
+
+The provided init script enables the per-instance watchdog on OpenWrt versions that support it. It passes `--procd-watchdog` to Python and sets `procd_set_param watchdog 1 60`. The detector feeds the local timer at most every 10 seconds from its actual working thread, including after bounded MQTT operations that fail. It also requires recent RSSI worker progress when RSSI polling is enabled; the RSSI freshness threshold is at least 30 seconds (or the configured poll interval plus 10 seconds). There is no additional watchdog daemon and no dependency on MQTT or Home Assistant being reachable. The ubus watchers retain their existing reconnect behavior.
+
+After 60 seconds without a feed, procd restarts the service, allowing 15 seconds for termination before force-killing it. The timer is independent of the MQTT health sensor. Detection of an RSSI-only stall also includes the RSSI freshness threshold. The init script keeps normal crash respawn limits (3600/5/5). Because watchdog-triggered restarts bypass that counter, Python permits at most four starts within a rolling 10-minute window, stored in RAM at `/var/run/presence-detector-watchdog.json`. This limit also includes manual starts. If exhausted, Python exits and procd's normal crash-loop limit applies. After fixing the cause, an administrator can stop the service, remove that file and start it again. No persistent flash writes are required by the watchdog.
+
+Install the updated Python file before enabling the new init script. Keep the script and configuration paths appropriate for your installation. On older OpenWrt versions without watchdog support the init script uses regular respawn only. When running Python outside procd, omit `--procd-watchdog`.
+
 ## (Optional) Home Assistant Configuration
 This section goes into a bit more detail about where the entity information discovered by OpenWRT is stored in HA, and how you can tune
 the appearance of the Wi-Fi device entities. This is all optional and not needed to get a functioning automation going.

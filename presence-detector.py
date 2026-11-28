@@ -11,6 +11,7 @@ MQTT Discovery.
 
 import argparse
 import json
+import os
 import queue
 import signal
 import subprocess
@@ -19,7 +20,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from queue import Queue
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Any, Callable
 
 from paho.mqtt import client as mqtt
@@ -43,6 +44,91 @@ class Logger:
             logoption=syslog.LOG_PID,
         )
         syslog.syslog(level, text)
+
+
+class ProcdWatchdog:
+    """Feed procd from actual worker progress, never from a timer thread."""
+
+    INTERVAL = 10
+    START_LIMIT = 4
+    START_WINDOW = 600
+    START_FILE = "/var/run/presence-detector-watchdog.json"
+
+    def __init__(self, logger: Logger, signal_interval: float) -> None:
+        self._logger = logger
+        self._signal_timeout = (
+            max(30.0, signal_interval + 10) if signal_interval > 0 else 0
+        )
+        self._signal_progress = time.monotonic()
+        self._next_feed = 0.0
+        self._status = ""
+
+    @classmethod
+    def reserve_start(cls, path: str) -> bool:
+        """Limit repeated starts across procd watchdog restarts (RAM only)."""
+        now = time.monotonic()
+        try:
+            with open(path, encoding="utf-8") as stream:
+                starts = json.load(stream)
+        except FileNotFoundError:
+            starts = []
+        if not isinstance(starts, list):
+            raise ValueError("invalid watchdog start history")
+        recent = [
+            stamp
+            for stamp in starts
+            if isinstance(stamp, (int, float))
+            and 0 <= now - stamp < cls.START_WINDOW
+        ]
+        if len(recent) >= cls.START_LIMIT:
+            return False
+        recent.append(now)
+        temporary = path + ".new"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(recent, stream)
+        os.replace(temporary, path)
+        return True
+
+    def signal_progress(self) -> None:
+        """Record progress even if an iw or MQTT operation failed normally."""
+        self._signal_progress = time.monotonic()
+
+    def _report(self, status: str) -> None:
+        if self._status != status:
+            self._logger.log(f"procd watchdog: {status}")
+            self._status = status
+
+    def feed(self) -> None:
+        """Only the detector thread may call this; rate-limit ubus calls."""
+        now = time.monotonic()
+        if now < self._next_feed:
+            return
+        self._next_feed = now + self.INTERVAL
+        if (
+            self._signal_timeout
+            and now - self._signal_progress >= self._signal_timeout
+        ):
+            self._report("RSSI worker stalled; withholding heartbeat")
+            return
+        try:
+            subprocess.run(
+                [
+                    "ubus",
+                    "-t",
+                    "3",
+                    "call",
+                    "service",
+                    "watchdog",
+                    '{"name":"presence-detector","instance":"instance1"}',
+                ],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            self._report("failed to feed timer")
+            return
+        self._report("heartbeat active")
 
 
 class Settings:
@@ -193,10 +279,15 @@ class SignalSample:
 class PresenceDetector(Thread):
     """Presence detector using ubus events plus local iw signal polling."""
 
-    def __init__(self, config_file: str) -> None:
+    def __init__(self, config_file: str, procd_watchdog: bool = False) -> None:
         super().__init__()
         self._settings = Settings(config_file)
         self._logger = Logger(self._settings.debug)
+        self._watchdog = (
+            ProcdWatchdog(self._logger, self._settings.signal_poll_interval)
+            if procd_watchdog
+            else None
+        )
         self._queue: Queue = Queue()
         self._watchers: dict[str, UbusWatcher] = {}
         self._killed = False
@@ -313,17 +404,31 @@ class PresenceDetector(Thread):
             self._queue.put(QueueItem("sync", "", QueueItem.Action.SYNC))
             self._queue_health_check()
 
+    def _watchdog_progress(self) -> None:
+        """Mark completed work without depending on its MQTT/ubus result."""
+        watchdog = self._watchdog
+        if watchdog is None:
+            return
+        worker = current_thread()
+        if worker is self:
+            watchdog.feed()
+        elif worker is self._signal_thread:
+            watchdog.signal_progress()
+
     def _publish(self, topic: str, data: str, retain=False) -> bool:
         self._logger.log(f"Publishing to {topic}: {data}", True)
-        if not self._mqtt.is_connected():
-            return False
-        result = self._mqtt.publish(topic, data, qos=1, retain=retain)
         try:
-            result.wait_for_publish(timeout=5)
-        except (RuntimeError, ValueError) as ex:
-            self._logger.log(f"Error publishing to {topic}: {ex}", False)
-            return False
-        return result.is_published()
+            if not self._mqtt.is_connected():
+                return False
+            result = self._mqtt.publish(topic, data, qos=1, retain=retain)
+            try:
+                result.wait_for_publish(timeout=5)
+            except (RuntimeError, ValueError) as ex:
+                self._logger.log(f"Error publishing to {topic}: {ex}", False)
+                return False
+            return result.is_published()
+        finally:
+            self._watchdog_progress()
 
     def _health_slug(self) -> str:
         """Return the stable MQTT/HA slug used for the service health entity."""
@@ -689,6 +794,8 @@ class PresenceDetector(Thread):
                 )
                 complete = False
                 continue
+            finally:
+                self._watchdog_progress()
 
             if process.returncode != 0:
                 self._logger.log(
@@ -758,6 +865,7 @@ class PresenceDetector(Thread):
 
         while not self._signal_stop.is_set():
             self._update_signal_sensors()
+            self._watchdog_progress()
             self._signal_wakeup.wait(timeout=interval)
             self._signal_wakeup.clear()
 
@@ -837,6 +945,8 @@ class PresenceDetector(Thread):
             except (OSError, subprocess.TimeoutExpired) as ex:
                 self._logger.log(f"Error running ubus for {interface}: {ex}")
                 return None
+            finally:
+                self._watchdog_progress()
             if process.returncode != 0:
                 self._logger.log(
                     f"Error running ubus for interface {interface}: {process.stderr}"
@@ -897,6 +1007,7 @@ class PresenceDetector(Thread):
 
     def stop(self, _signum: int | None = None, _frame: int | None = None):
         """Stop this thread as soon as possible."""
+        self._watchdog = None
         self._logger.log("Stopping...")
         self.stop_watchers()
         self.stop_signal_poller()
@@ -1010,6 +1121,7 @@ class PresenceDetector(Thread):
         next_sync = time.monotonic() + sync_interval if sync_interval > 0 else None
 
         while not self._killed:
+            self._watchdog_progress()
             # A periodic deadline must not be postponed by frequent MQTT health
             # messages, RSSI activity, or continuous ubus client events.
             if next_sync is not None and time.monotonic() >= next_sync:
@@ -1022,6 +1134,14 @@ class PresenceDetector(Thread):
                 if next_sync is not None
                 else None
             )
+            watchdog = self._watchdog
+            if watchdog is not None:
+                # Feed even if fallback sync and MQTT heartbeat are disabled.
+                queue_timeout = (
+                    watchdog.INTERVAL
+                    if queue_timeout is None
+                    else min(queue_timeout, watchdog.INTERVAL)
+                )
             try:
                 item: QueueItem = self._queue.get(timeout=queue_timeout)
             except queue.Empty:
@@ -1179,9 +1299,25 @@ def main():
         help="Filename of configuration file",
         default="/etc/config/presence-detector.settings.json",
     )
+    parser.add_argument(
+        "--procd-watchdog",
+        action="store_true",
+        help="Feed the presence-detector procd instance watchdog",
+    )
     args = parser.parse_args()
 
-    detector = PresenceDetector(args.config)
+    if args.procd_watchdog:
+        logger = Logger(False)
+        try:
+            allowed = ProcdWatchdog.reserve_start(ProcdWatchdog.START_FILE)
+        except (OSError, ValueError) as ex:
+            logger.log(f"procd watchdog: cannot record start history: {ex}")
+            raise SystemExit(1) from ex
+        if not allowed:
+            logger.log("procd watchdog: start limit reached (4 starts in 10 min)")
+            raise SystemExit(1)
+
+    detector = PresenceDetector(args.config, procd_watchdog=args.procd_watchdog)
     detector.start()
     signal.signal(signal.SIGTERM, detector.stop)
     signal.signal(signal.SIGINT, detector.stop)

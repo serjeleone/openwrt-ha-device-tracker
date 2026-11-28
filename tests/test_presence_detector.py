@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,88 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PresenceDetectorRecoveryTests(unittest.TestCase):
+    def test_watchdog_feeds_only_every_ten_seconds(self):
+        clock = [100.0]
+        with patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]):
+            watchdog = MODULE.ProcdWatchdog(Mock(), 0)
+            with patch.object(MODULE.subprocess, "run") as ubus:
+                watchdog.feed()
+                clock[0] += 9
+                watchdog.feed()
+                self.assertEqual(ubus.call_count, 1)
+                clock[0] += 1
+                watchdog.feed()
+                self.assertEqual(ubus.call_count, 2)
+                self.assertEqual(ubus.call_args.kwargs["timeout"], 5)
+                self.assertIn("watchdog", ubus.call_args.args[0])
+
+    def test_watchdog_withholds_feed_if_rssi_stalls_and_resumes_on_progress(self):
+        clock = [100.0]
+        with patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]):
+            watchdog = MODULE.ProcdWatchdog(Mock(), 2)
+            with patch.object(MODULE.subprocess, "run") as ubus:
+                watchdog.feed()
+                clock[0] += 30
+                watchdog.feed()
+                self.assertEqual(ubus.call_count, 1)
+                watchdog.signal_progress()
+                clock[0] += 10
+                watchdog.feed()
+                self.assertEqual(ubus.call_count, 2)
+
+    def test_watchdog_feed_failure_is_bounded_and_retried(self):
+        clock = [100.0]
+        with patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]):
+            watchdog = MODULE.ProcdWatchdog(Mock(), 0)
+            with patch.object(
+                MODULE.subprocess, "run",
+                side_effect=[subprocess.TimeoutExpired("ubus", 5), None],
+            ) as ubus:
+                watchdog.feed()
+                clock[0] += 10
+                watchdog.feed()
+                self.assertEqual(ubus.call_count, 2)
+
+    def test_watchdog_start_limit_survives_process_restarts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "watchdog.json")
+            for now in (100, 180, 260, 340):
+                with patch.object(MODULE.time, "monotonic", return_value=now):
+                    self.assertTrue(MODULE.ProcdWatchdog.reserve_start(path))
+            with patch.object(MODULE.time, "monotonic", return_value=420):
+                self.assertFalse(MODULE.ProcdWatchdog.reserve_start(path))
+            with patch.object(MODULE.time, "monotonic", return_value=701):
+                self.assertTrue(MODULE.ProcdWatchdog.reserve_start(path))
+
+    def test_watchdog_progress_is_not_tied_to_successful_mqtt(self):
+        detector = MODULE.PresenceDetector.__new__(MODULE.PresenceDetector)
+        detector._logger = Mock()
+        detector._mqtt = Mock()
+        detector._mqtt.is_connected.return_value = False
+        detector._watchdog = Mock()
+        detector._signal_thread = None
+        with patch.object(MODULE, "current_thread", return_value=detector):
+            self.assertFalse(detector._publish("test", "offline"))
+        detector._watchdog.feed.assert_called_once()
+
+    def test_watchdog_bounds_idle_queue_even_without_other_heartbeats(self):
+        detector = MODULE.PresenceDetector.__new__(MODULE.PresenceDetector)
+        detector._settings = SimpleNamespace(fallback_sync_interval=0)
+        detector._killed = False
+        detector._watchdog = Mock(INTERVAL=10)
+        detector._queue = Mock()
+        detector._queue.get.return_value = MODULE.QueueItem(
+            "quit", "", MODULE.QueueItem.Action.QUIT
+        )
+        detector._do_full_sync = Mock()
+        detector.start_watchers = Mock()
+        detector.start_signal_poller = Mock()
+        detector.start_health_monitor = Mock()
+        with patch.object(MODULE, "current_thread", return_value=detector):
+            detector.run()
+        detector._queue.get.assert_called_once_with(timeout=10)
+        detector._watchdog.feed.assert_called_once()
+
     def test_auto_discovery_refreshes_interfaces(self):
         settings = MODULE.Settings.__new__(MODULE.Settings)
         settings._settings = {"interfaces": ["hostapd.phy0-ap0"]}
@@ -45,6 +128,7 @@ class PresenceDetectorRecoveryTests(unittest.TestCase):
             interfaces=["hostapd.phy0-ap0", "hostapd.phy1-ap0"]
         )
         detector._logger = Mock()
+        detector._watchdog = None
         first = subprocess.CompletedProcess(
             args=["ubus"], returncode=0,
             stdout=json.dumps({"clients": {"34:39:16:71:a2:ac": {}}}),
@@ -76,6 +160,7 @@ class PresenceDetectorRecoveryTests(unittest.TestCase):
         detector._settings = SimpleNamespace(fallback_sync_interval=30)
         detector._logger = Mock()
         detector._killed = False
+        detector._watchdog = None
         detector._queue = Mock()
         detector._health_pending = Mock()
         detector._signal_wakeup = Mock()
